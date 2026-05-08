@@ -42,7 +42,10 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/forwardproxy/httpclient"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
+	"github.com/sagernet/sing/protocol/socks"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 )
@@ -103,6 +106,10 @@ type Handler struct {
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
+	// socksUDPClient is set only when upstream is socks5://. UDP-over-TCP
+	// listens on this client (UDP ASSOCIATE) so audit/routing upstreams see
+	// UDP traffic instead of having it leak directly out of this process.
+	socksUDPClient *socks.Client
 
 	aclRules []aclRule
 
@@ -239,6 +246,18 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			h.dialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 				return upstreamDialer.Dial(network, address)
 			}
+		}
+
+		// SOCKS5 upstreams can also carry UDP via UDP ASSOCIATE. Build a sing
+		// socks.Client for the UoT path so UDP-over-TCP traffic doesn't leak
+		// straight out of this process when an upstream is configured.
+		switch strings.ToLower(h.upstream.Scheme) {
+		case "socks", "socks5":
+			udpClient, err := socks.NewClientFromURL(N.SystemDialer, h.Upstream)
+			if err != nil {
+				return fmt.Errorf("build SOCKS5 UDP client for upstream: %w", err)
+			}
+			h.socksUDPClient = udpClient
 		}
 	}
 
@@ -516,12 +535,30 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	if host == uot.MagicAddress || host == uot.LegacyMagicAddress {
-		udpConn, err := net.ListenUDP("udp", nil)
-		if err != nil {
-			return nil, err
+		var pc net.PacketConn
+		switch {
+		case h.socksUDPClient != nil:
+			// SOCKS5 upstream — route UDP through UDP ASSOCIATE so the upstream
+			// observes (and can filter / audit) the actual UDP traffic.
+			var err error
+			pc, err = h.socksUDPClient.ListenPacket(ctx, M.Socksaddr{})
+			if err != nil {
+				return nil, caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("upstream SOCKS5 UDP ASSOCIATE failed: %w", err))
+			}
+		case h.upstream != nil:
+			// HTTP CONNECT upstreams cannot tunnel UDP. Refuse rather than
+			// silently leaking the UDP traffic directly out of this process.
+			return nil, caddyhttp.Error(http.StatusBadGateway,
+				errors.New("UDP-over-TCP cannot be tunneled through an HTTP CONNECT upstream"))
+		default:
+			udpConn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+			pc = udpConn
 		}
-
-		return uot.NewServerConn(udpConn, uot.Version), nil
+		return uot.NewServerConn(pc, uot.Version), nil
 	}
 
 	if h.upstream != nil {
