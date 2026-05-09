@@ -558,7 +558,13 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 			}
 			pc = udpConn
 		}
-		return uot.NewServerConn(pc, uot.Version), nil
+		// The framing differs between v1 and v2; pick the one matching the magic
+		// the client used so legacy clients don't desync against a v2 server.
+		version := uot.Version
+		if host == uot.LegacyMagicAddress {
+			version = uot.LegacyVersion
+		}
+		return uot.NewServerConn(pc, version), nil
 	}
 
 	if h.upstream != nil {
