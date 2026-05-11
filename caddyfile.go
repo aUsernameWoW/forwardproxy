@@ -184,6 +184,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.Upstream = args[0]
 
+		case "udp_uri_template":
+			args := d.RemainingArgs()
+			if len(args) != 1 {
+				return d.ArgErr()
+			}
+			if h.URITemplate != "" {
+				return d.Err("udp_uri_template directive specified more than once")
+			}
+			h.URITemplate = args[0]
+
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				aclDirective := d.Val()

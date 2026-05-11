@@ -6,6 +6,7 @@ toolchain go1.22.2
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4
+	github.com/dunglas/httpsfv v1.1.0
 	github.com/quic-go/quic-go v0.49.1
 	github.com/sagernet/sing v0.7.5
 	go.uber.org/mock v0.5.0

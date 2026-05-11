@@ -115,6 +115,13 @@ type Handler struct {
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
+
+	// MASQUE / RFC 9298 CONNECT-UDP server. Active when no upstream is set.
+	udpProxyServer udpProxyServer
+
+	// URI template used to match incoming connect-udp requests (RFC 6570 style).
+	// Defaults to https://{host}/.well-known/masque/udp/{target_host}/{target_port}/
+	URITemplate string `json:"udp_uri_template,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -261,6 +268,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// MASQUE / RFC 9298: init the connect-udp handler. Active when no
+	// upstream is set; coexists with UoT on regular CONNECT tunnels.
+	var err error
+	h.udpProxyServer, err = newUDPProxyServer(h.URITemplate, h.logger)
+	if err != nil {
+		return fmt.Errorf("create udp proxy: %w", err)
+	}
+
 	return nil
 }
 
@@ -311,6 +326,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		ctxHeader.Add("Forwarded", "for=\""+r.RemoteAddr+"\"")
 		ctx = context.WithValue(ctx, httpclient.ContextKeyHeader{}, ctxHeader)
+	}
+
+	// RFC 9298 — try CONNECT-UDP / MASQUE before the regular CONNECT path.
+	// tryUDPoverHTTP returns (false, _) when the request isn't a connect-udp
+	// request, in which case we fall through to the normal proxy path.
+	isUDPoverHTTP, udpErr := h.tryUDPoverHTTP(w, r)
+	if isUDPoverHTTP {
+		if udpErr != nil {
+			return fmt.Errorf("handle UDP over HTTP error: %w", udpErr)
+		}
+		return nil
 	}
 
 	if r.Method == http.MethodConnect {
