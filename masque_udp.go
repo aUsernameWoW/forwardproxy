@@ -745,7 +745,16 @@ func (srv udpProxyServer) HandleStreamBind(c io.ReadWriter, req Request, rc *net
 	return nil
 }
 
-func (srv udpProxyServer) HandlePacket(str http3.Stream, req Request, rc *net.UDPConn) error {
+// http3UDPStream is the subset of *http3.Stream that HandlePacket uses.
+// Defining it lets tests inject a mock without depending on quic-go's
+// concrete Stream type (which changed from interface to struct in v0.54).
+type http3UDPStream interface {
+	io.Reader
+	SendDatagram([]byte) error
+	ReceiveDatagram(context.Context) ([]byte, error)
+}
+
+func (srv udpProxyServer) HandlePacket(str http3UDPStream, req Request, rc *net.UDPConn) error {
 	// https://github.com/quic-go/masque-go/issues/64
 	if req == "*" {
 		return srv.HandlePacketBind(str, req, rc)
@@ -813,7 +822,7 @@ func (srv udpProxyServer) HandlePacket(str http3.Stream, req Request, rc *net.UD
 	return nil
 }
 
-func (srv udpProxyServer) HandlePacketBind(str http3.Stream, req Request, c *net.UDPConn) error {
+func (srv udpProxyServer) HandlePacketBind(str http3UDPStream, req Request, c *net.UDPConn) error {
 	return fmt.Errorf("connect-udp-bind over http3 is not supported yet")
 }
 
