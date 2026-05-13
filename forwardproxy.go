@@ -95,6 +95,14 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
+	// When true (and Upstream is a socks/socks5 URL), the sing UoT magic
+	// address (sp.v2.udp-over-tcp.arpa / sp.udp-over-tcp.arpa) is passed
+	// through to the SOCKS5 upstream as a regular CONNECT target instead
+	// of being decoded into real UDP locally. Useful when the upstream is
+	// itself UoT-aware (e.g. sing-box) and you want to avoid the local
+	// parse + UDP ASSOCIATE round-trip.
+	PassthroughUoT bool `json:"passthrough_uot,omitempty"`
+
 	// Access control list.
 	ACL []ACLRule `json:"acl,omitempty"`
 
@@ -258,14 +266,24 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		// SOCKS5 upstreams can also carry UDP via UDP ASSOCIATE. Build a sing
 		// socks.Client for the UoT path so UDP-over-TCP traffic doesn't leak
 		// straight out of this process when an upstream is configured.
+		// When PassthroughUoT is set we skip this entirely: the UoT magic
+		// address is forwarded to the upstream as a regular CONNECT target.
 		switch strings.ToLower(h.upstream.Scheme) {
 		case "socks", "socks5":
-			udpClient, err := socks.NewClientFromURL(N.SystemDialer, h.Upstream)
-			if err != nil {
-				return fmt.Errorf("build SOCKS5 UDP client for upstream: %w", err)
+			if !h.PassthroughUoT {
+				udpClient, err := socks.NewClientFromURL(N.SystemDialer, h.Upstream)
+				if err != nil {
+					return fmt.Errorf("build SOCKS5 UDP client for upstream: %w", err)
+				}
+				h.socksUDPClient = udpClient
 			}
-			h.socksUDPClient = udpClient
+		default:
+			if h.PassthroughUoT {
+				return fmt.Errorf("passthrough_uot requires a socks/socks5 upstream, got %q", h.upstream.Scheme)
+			}
 		}
+	} else if h.PassthroughUoT {
+		return errors.New("passthrough_uot requires an upstream to be configured")
 	}
 
 	// MASQUE / RFC 9298: init the connect-udp handler. Active when no
@@ -560,7 +578,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
-	if host == uot.MagicAddress || host == uot.LegacyMagicAddress {
+	if (host == uot.MagicAddress || host == uot.LegacyMagicAddress) && !h.PassthroughUoT {
 		var pc net.PacketConn
 		switch {
 		case h.socksUDPClient != nil:

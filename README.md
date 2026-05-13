@@ -108,6 +108,11 @@ forward_proxy {
 	max_idle_conns_per_host 2
 
 	upstream https://user:password@extra-upstream-hop.com
+	# When upstream is socks5:// and the upstream itself understands
+	# sing UoT — currently this is essentially only sing-box (and other
+	# sing-based tools) — enable passthrough to skip local UoT decoding
+	# and forward the magic-address CONNECT to upstream as-is.
+	# passthrough_uot
 
 	acl {
 		allow     *.caddyserver.com
@@ -247,6 +252,25 @@ By default, forwardproxy will reuse connections by using Go's built-in connectio
   Supported schemes to localhost: socks5, http, https (certificate check is ignored).
 
   Default: no upstream proxy.
+- `passthrough_uot`
+  When set, the sing UoT magic addresses (`sp.v2.udp-over-tcp.arpa`,
+  `sp.udp-over-tcp.arpa`) are forwarded to the upstream as ordinary
+  CONNECT targets instead of being decoded into real UDP locally.
+  Only valid when `upstream` is a `socks5://` URL — Caddy will refuse
+  to start otherwise.
+
+  In practice the upstream must speak sing UoT for the passed-through
+  request to be parsed correctly; today that effectively means **only
+  sing-box (and other sing-based tools)**. Pointing this at a generic
+  SOCKS5 server that doesn't recognise the magic address will just
+  produce CONNECT failures (or a TCP stream of UoT bytes the upstream
+  has no idea what to do with).
+
+  When enabled, this avoids the local parse → SOCKS5 UDP ASSOCIATE
+  round-trip in fully UoT-aware chains.
+
+  Default: off; UoT is decoded locally (and, if a SOCKS5 upstream is
+  set, re-emitted via UDP ASSOCIATE).
 
 ## Get forwardproxy
 ### Download prebuilt binary
