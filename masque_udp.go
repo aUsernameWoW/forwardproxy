@@ -966,6 +966,31 @@ func (srv udpProxyServer) ParseRequest(r *http.Request) (Request, error) {
 	return Request(net.JoinHostPort(targetHost, strconv.Itoa(targetPort))), nil
 }
 
+// httpStream adapts a buffering HTTP ResponseWriter plus a request body into a
+// single io.ReadWriter for HandleStream. It is used on the HTTP/2 connect-udp
+// path, where the stdlib ResponseWriter implements neither http.Hijacker nor
+// auto-flushing: reads come from the request body and each write is flushed so
+// datagrams reach the client without waiting for the writer's own buffering.
+type httpStream struct {
+	r  io.Reader
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func newHTTPStream(w http.ResponseWriter, body io.Reader) *httpStream {
+	return &httpStream{r: body, w: w, rc: http.NewResponseController(w)}
+}
+
+func (s *httpStream) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+func (s *httpStream) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	return n, s.rc.Flush()
+}
+
 // tryUDPoverHTTP handles an incoming connect-udp request per RFC 9298.
 // Returns (true, err) when the request was claimed by the MASQUE path
 // (regardless of outcome); (false, nil) when it should fall through to
@@ -1047,7 +1072,7 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 	switch r.ProtoMajor {
 	case 1:
 		w.Header().Set("Connection", "Upgrade")
-		w.Header().Set("Upgrade:", RequestProtocol)
+		w.Header().Set("Upgrade", RequestProtocol)
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
 		if req == "*" {
 			w.Header().Set(ConnectUDPBindHeader, ConnectUDPBindHeaderValue)
@@ -1076,19 +1101,18 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		}
 		w.WriteHeader(http.StatusOK)
 
+		// The stdlib HTTP/2 ResponseWriter implements neither http.Hijacker nor
+		// auto-flushing, so (unlike HTTP/1.1) we cannot take over a raw net.Conn.
+		// Mirror the regular HTTP/2 CONNECT path: read the capsule stream from
+		// the request body and write back through the ResponseWriter, flushing
+		// each datagram so it reaches the client promptly.
 		rc := http.NewResponseController(w)
-		err = rc.Flush()
-		if err != nil {
+		if err = rc.Flush(); err != nil {
 			return true, caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("ResponseWriter flush error: %v", err))
 		}
+		defer r.Body.Close()
 
-		conn, _, err := rc.Hijack()
-		if err != nil {
-			return true, err
-		}
-		defer conn.Close()
-
-		return true, h.udpProxyServer.HandleStream(conn, req, rconn, h.destinationAllowed)
+		return true, h.udpProxyServer.HandleStream(newHTTPStream(w, r.Body), req, rconn, h.destinationAllowed)
 	case 3:
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
 		w.WriteHeader(http.StatusOK)
