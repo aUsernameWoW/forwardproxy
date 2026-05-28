@@ -502,8 +502,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		defer response.Body.Close()
 	}
 	if err != nil {
-		if _, ok := err.(caddyhttp.HandlerError); ok {
-			return err
+		// The ACL check runs inside httpTransport's DialContext, so a denial
+		// (e.g. 403) comes back wrapped in a transport error rather than as a
+		// bare HandlerError. Unwrap with errors.As so the operator's status
+		// reaches the client instead of a blanket 502.
+		var handlerErr caddyhttp.HandlerError
+		if errors.As(err, &handlerErr) {
+			return handlerErr
 		}
 		return caddyhttp.Error(http.StatusBadGateway,
 			fmt.Errorf("failed to read response: %v", err))
