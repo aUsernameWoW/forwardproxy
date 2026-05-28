@@ -994,7 +994,10 @@ func (s *httpStream) Write(p []byte) (int, error) {
 // tryUDPoverHTTP handles an incoming connect-udp request per RFC 9298.
 // Returns (true, err) when the request was claimed by the MASQUE path
 // (regardless of outcome); (false, nil) when it should fall through to
-// the normal proxy path.
+// the normal proxy path. The claim boundary is a successful ParseRequest:
+// once the request is recognised as connect-udp, every later failure is
+// returned as (true, err) so the caller surfaces the status (e.g. 403/502)
+// to the client instead of silently falling through.
 func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, error) {
 	// do not handle UDP over HTTP if upstream is set
 	if h.upstream != nil {
@@ -1003,7 +1006,9 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 
 	req, err := h.udpProxyServer.ParseRequest(r)
 	if err != nil {
-		return false, err
+		// Not a connect-udp request (or one we can't parse): not claimed,
+		// fall through to the normal proxy path per the contract above.
+		return false, nil
 	}
 
 	var rconn *net.UDPConn
@@ -1011,7 +1016,8 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		err := error(nil)
 		rconn, err = net.ListenUDP("udp", nil)
 		if err != nil {
-			return false, fmt.Errorf("listen UDP connection error: %w", err)
+			return true, caddyhttp.Error(http.StatusInternalServerError,
+				fmt.Errorf("listen UDP connection error: %w", err))
 		}
 		defer rconn.Close()
 	} else {
@@ -1054,17 +1060,19 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 			return false, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 		}(string(req))
 		if !ok {
-			return false, err
+			return true, err
 		}
 
 		raddr, err := net.ResolveUDPAddr("udp", string(req))
 		if err != nil {
-			return false, fmt.Errorf("resolve UDP address error: %w", err)
+			return true, caddyhttp.Error(http.StatusBadGateway,
+				fmt.Errorf("resolve UDP address error: %w", err))
 		}
 
 		rconn, err = net.DialUDP("udp", nil, raddr)
 		if err != nil {
-			return false, fmt.Errorf("dial UDP connection error: %w", err)
+			return true, caddyhttp.Error(http.StatusBadGateway,
+				fmt.Errorf("dial UDP connection error: %w", err))
 		}
 		defer rconn.Close()
 	}
