@@ -842,8 +842,8 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		go stream(target, clientReader, RemovePadding)
 		return stream(clientWriter, target, AddPadding)
 	}
-	go stream(target, clientReader, RemovePadding) //nolint: errcheck
-	return stream(clientWriter, target, AddPadding)
+	go stream(target, clientReader, NoPadding) //nolint: errcheck
+	return stream(clientWriter, target, NoPadding)
 }
 
 type closeWriter interface {
