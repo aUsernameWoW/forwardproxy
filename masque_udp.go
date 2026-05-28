@@ -97,6 +97,13 @@ func (data *Datagram) ReceiveBuffer(r io.Reader, b []byte) error {
 		return fmt.Errorf("receive datagram length error: %w", err)
 	}
 
+	// data.Length is an attacker-controlled varint (up to 2^62-1). Reject
+	// anything larger than the caller's buffer before slicing, otherwise
+	// b[:data.Length] panics out of bounds and crashes the whole process.
+	if data.Length > uint64(len(b)) {
+		return fmt.Errorf("receive datagram payload error: length %d exceeds buffer size %d", data.Length, len(b))
+	}
+
 	bb := b[:data.Length]
 	_, err = io.ReadFull(r, bb)
 	if err != nil {
@@ -205,13 +212,23 @@ func (data *UncompressedPayload) Parse(b []byte) error {
 
 	data.ContextID = id
 
+	if nr >= len(b) {
+		return fmt.Errorf("uncompressed payload truncated: missing IP version")
+	}
+
 	switch b[nr] { // IPVersion
 	case 4:
+		if len(b) < nr+7 {
+			return fmt.Errorf("uncompressed payload truncated: need %d bytes for IPv4 address+port, have %d", nr+7, len(b))
+		}
 		data.IPVersion = 4
 		data.Addr = netip.AddrFrom4([4]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4]})
 		data.Port = uint16(b[nr+5])<<8 | uint16(b[nr+6])
 		data.Payload = b[nr+7:]
 	case 6:
+		if len(b) < nr+19 {
+			return fmt.Errorf("uncompressed payload truncated: need %d bytes for IPv6 address+port, have %d", nr+19, len(b))
+		}
 		data.IPVersion = 6
 		data.Addr = netip.AddrFrom16(
 			[16]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4],
@@ -265,14 +282,24 @@ func (data *CompressionAssignPayload) Parse(b []byte) error {
 
 	data.ContextID = id
 
+	if nr >= len(b) {
+		return fmt.Errorf("compression assign payload truncated: missing IP version")
+	}
+
 	switch b[nr] { // IPVersion
 	case 0:
 		data.IPVersion = 0
 	case 4:
+		if len(b) < nr+7 {
+			return fmt.Errorf("compression assign payload truncated: need %d bytes for IPv4 address+port, have %d", nr+7, len(b))
+		}
 		data.IPVersion = 4
 		data.Addr = netip.AddrFrom4([4]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4]})
 		data.Port = uint16(b[nr+5])<<8 | uint16(b[nr+6])
 	case 6:
+		if len(b) < nr+19 {
+			return fmt.Errorf("compression assign payload truncated: need %d bytes for IPv6 address+port, have %d", nr+19, len(b))
+		}
 		data.IPVersion = 6
 		data.Addr = netip.AddrFrom16(
 			[16]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4],
@@ -459,11 +486,23 @@ func (nm *PacketConn) ReadPacket(b []byte) ([]byte, netip.AddrPort, error) {
 					// ignore all packets with context id 2 when assign-close is set
 					continue
 				}
+				// bb is an attacker-sized payload; validate length before
+				// indexing the inline address/port so a short frame can't
+				// panic the read goroutine and crash the process.
+				if len(bb) < 2 {
+					return nil, netip.AddrPortFrom(netip.AddrFrom4([4]byte{}), 0), fmt.Errorf("id-2 datagram truncated: missing IP version")
+				}
 				switch bb[1] {
 				case 4:
+					if len(bb) < 8 {
+						return nil, netip.AddrPortFrom(netip.AddrFrom4([4]byte{}), 0), fmt.Errorf("id-2 datagram truncated: need 8 bytes for IPv4 address+port, have %d", len(bb))
+					}
 					return bb[8:], netip.AddrPortFrom(netip.AddrFrom4(
 						[4]byte{bb[2], bb[3], bb[4], bb[5]}), uint16(bb[6])<<8|uint16(bb[7])), nil
 				case 6:
+					if len(bb) < 20 {
+						return nil, netip.AddrPortFrom(netip.AddrFrom4([4]byte{}), 0), fmt.Errorf("id-2 datagram truncated: need 20 bytes for IPv6 address+port, have %d", len(bb))
+					}
 					return bb[20:], netip.AddrPortFrom(netip.AddrFrom16(
 						[16]byte{bb[2], bb[3], bb[4], bb[5],
 							bb[6], bb[7], bb[8], bb[9],
@@ -632,9 +671,12 @@ func newUDPProxyServer(uri string, lg *zap.Logger) (udpProxyServer, error) {
 	return srv, err
 }
 
-func (srv udpProxyServer) HandleStream(c io.ReadWriter, req Request, rc *net.UDPConn) error {
+// allowed, when non-nil, gates each per-packet destination in bind mode; nil
+// allows all (used by the fixed-target path, which is ACL-checked before dial,
+// and by tests).
+func (srv udpProxyServer) HandleStream(c io.ReadWriter, req Request, rc *net.UDPConn, allowed func(netip.AddrPort) bool) error {
 	if req == "*" {
-		return srv.HandleStreamBind(c, req, rc)
+		return srv.HandleStreamBind(c, req, rc, allowed)
 	}
 
 	done := make(chan struct{})
@@ -701,7 +743,7 @@ func (srv udpProxyServer) HandleStream(c io.ReadWriter, req Request, rc *net.UDP
 	return nil
 }
 
-func (srv udpProxyServer) HandleStreamBind(c io.ReadWriter, req Request, rc *net.UDPConn) error {
+func (srv udpProxyServer) HandleStreamBind(c io.ReadWriter, req Request, rc *net.UDPConn, allowed func(netip.AddrPort) bool) error {
 	pc := newPacketConn(c)
 
 	done := make(chan struct{})
@@ -712,6 +754,13 @@ func (srv udpProxyServer) HandleStreamBind(c io.ReadWriter, req Request, rc *net
 			pkt, addr, err := pc.ReadPacket(bb)
 			if err != nil {
 				break
+			}
+
+			// In bind mode the client picks the destination of every packet,
+			// so each one must pass the ACL/port allowlist. Drop disallowed
+			// destinations rather than killing the session.
+			if allowed != nil && !allowed(addr) {
+				continue
 			}
 
 			_, err = rc.WriteToUDPAddrPort(pkt, addr)
@@ -1018,7 +1067,7 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		}
 		defer conn.Close()
 
-		return true, h.udpProxyServer.HandleStream(conn, req, rconn)
+		return true, h.udpProxyServer.HandleStream(conn, req, rconn, h.destinationAllowed)
 	case 2:
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
 		if req == "*" {
@@ -1039,7 +1088,7 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		}
 		defer conn.Close()
 
-		return true, h.udpProxyServer.HandleStream(conn, req, rconn)
+		return true, h.udpProxyServer.HandleStream(conn, req, rconn, h.destinationAllowed)
 	case 3:
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
 		w.WriteHeader(http.StatusOK)

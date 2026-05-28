@@ -477,7 +477,7 @@ func TestHandleStream(t *testing.T) {
 			}
 			defer rc.Close()
 
-			if err := srv.HandleStream(conn, Request("127.0.0.1:8899"), rc.(*net.UDPConn)); err != nil {
+			if err := srv.HandleStream(conn, Request("127.0.0.1:8899"), rc.(*net.UDPConn), nil); err != nil {
 				t.Errorf("handle stream error: %v", err)
 			}
 		}()
@@ -556,7 +556,7 @@ func TestHandleStreamBind(t *testing.T) {
 			}
 			defer rc.Close()
 
-			if err := srv.HandleStream(conn, Request("*"), rc); err != nil {
+			if err := srv.HandleStream(conn, Request("*"), rc, nil); err != nil {
 				t.Errorf("handle stream error: %v", err)
 			}
 		}()
@@ -800,7 +800,7 @@ func TestHandleStreamBindCompressionPayload(t *testing.T) {
 		}
 		defer rc.Close()
 
-		if err := srv.HandleStream(conn, Request("*"), rc); err != nil {
+		if err := srv.HandleStream(conn, Request("*"), rc, nil); err != nil {
 			t.Errorf("handle stream error: %v", err)
 		}
 	}()
@@ -1164,6 +1164,63 @@ func TestParseRequst(t *testing.T) {
 					t.Errorf("parse request error: %v, want: %s, get: %s", err, v.Request[i], req)
 				}
 			}
+		}
+	})
+}
+
+// TestParserBoundsNoPanic feeds attacker-shaped frames (oversized declared
+// length, truncated address fields) to the wire parsers and asserts they
+// return an error rather than panicking on an out-of-range slice. A panic
+// here is a remote process-wide DoS, since these parsers run in read
+// goroutines with no recover (see merged_bug_004).
+func TestParserBoundsNoPanic(t *testing.T) {
+	t.Run("ReceiveBuffer rejects oversized length", func(t *testing.T) {
+		// Type=0, Length=16384 (varint 0x80 0x00 0x40 0x00), into a 2048 buf.
+		frame := []byte{0x00, 0x80, 0x00, 0x40, 0x00}
+		d := Datagram{}
+		if err := d.ReceiveBuffer(bytes.NewReader(frame), make([]byte, 2048)); err == nil {
+			t.Fatal("expected error for length exceeding buffer, got nil")
+		}
+	})
+
+	t.Run("UncompressedPayload.Parse rejects truncated input", func(t *testing.T) {
+		cases := [][]byte{
+			{0x00},                   // context id only, missing IP version
+			{0x00, 0x04, 0x01, 0x02}, // v4 but only 2 of 6 addr+port bytes
+			{0x00, 0x06, 0x01},       // v6 but only 1 of 18 addr+port bytes
+		}
+		for i, b := range cases {
+			pl := &UncompressedPayload{}
+			if err := pl.Parse(b); err == nil {
+				t.Errorf("case %d: expected error for truncated input %v, got nil", i, b)
+			}
+		}
+	})
+
+	t.Run("CompressionAssignPayload.Parse rejects truncated input", func(t *testing.T) {
+		cases := [][]byte{
+			{0x02},             // context id only, missing IP version
+			{0x02, 0x04, 0x01}, // v4 but only 1 of 6 addr+port bytes
+			{0x02, 0x06, 0x01}, // v6 but only 1 of 18 addr+port bytes
+		}
+		for i, b := range cases {
+			pl := &CompressionAssignPayload{}
+			if err := pl.Parse(b); err == nil {
+				t.Errorf("case %d: expected error for truncated input %v, got nil", i, b)
+			}
+		}
+	})
+
+	t.Run("ReadPacket rejects truncated id-2 datagram", func(t *testing.T) {
+		// Type=0, Length=2, payload = [0x02, 0x04]: context id 2, IP version 4,
+		// but no address/port bytes follow.
+		frame := []byte{0x00, 0x02, 0x02, 0x04}
+		pc := newPacketConn(struct {
+			io.Reader
+			io.Writer
+		}{Reader: bytes.NewReader(frame), Writer: io.Discard})
+		if _, _, err := pc.ReadPacket(make([]byte, 2048)); err == nil {
+			t.Fatal("expected error for truncated id-2 datagram, got nil")
 		}
 	})
 }

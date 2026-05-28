@@ -29,6 +29,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -612,7 +613,11 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 			if err != nil {
 				return nil, err
 			}
-			pc = udpConn
+			// The UoT codec decodes a client-chosen destination from every
+			// frame and writes to it via WriteTo. Without an upstream there is
+			// no other policy enforcement point, so wrap the socket to run the
+			// same port allowlist / ACL checks the TCP CONNECT path applies.
+			pc = &aclPacketConn{PacketConn: udpConn, allowed: h.destinationAllowed}
 		}
 		// The framing differs between v1 and v2; pick the one matching the magic
 		// the client used so legacy clients don't desync against a v2 server.
@@ -674,6 +679,55 @@ match:
 	}
 
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+}
+
+// destinationAllowed reports whether a per-packet UDP destination chosen by
+// the client passes the port allowlist and ACL rules. It is used by the paths
+// where the client selects the destination of each datagram rather than a
+// fixed CONNECT target — UoT (via aclPacketConn here) and MASQUE bind mode
+// (HandleStreamBind in masque_udp.go). The destination is always a resolved IP
+// at these call sites (sing's UoT codec resolves FQDNs before WriteTo, and
+// MASQUE bind frames carry literal addresses), so an IP-based ACL walk applies.
+func (h Handler) destinationAllowed(addr netip.AddrPort) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	if !h.portIsAllowed(strconv.Itoa(int(addr.Port()))) {
+		return false
+	}
+	ip := addr.Addr()
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+	return h.hostIsAllowed(ip.String(), net.IP(ip.AsSlice()))
+}
+
+// aclPacketConn enforces destinationAllowed on each datagram destination for
+// the no-upstream UoT path. Disallowed destinations are dropped (reported as
+// written) so a single blocked packet doesn't tear down the whole UoT session.
+type aclPacketConn struct {
+	net.PacketConn
+	allowed func(netip.AddrPort) bool
+}
+
+func (c *aclPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if ap, ok := netAddrToAddrPort(addr); ok && !c.allowed(ap) {
+		return len(b), nil
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// netAddrToAddrPort extracts a netip.AddrPort from a net.Addr. The UoT codec
+// always passes a resolved *net.UDPAddr; the parse fallback covers other
+// implementations. Returns ok=false when no IP destination can be determined.
+func netAddrToAddrPort(addr net.Addr) (netip.AddrPort, bool) {
+	if u, ok := addr.(*net.UDPAddr); ok {
+		return u.AddrPort(), true
+	}
+	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return ap, true
+	}
+	return netip.AddrPort{}, false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
