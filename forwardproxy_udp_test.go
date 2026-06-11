@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -955,7 +956,7 @@ func TestHandlePacket(t *testing.T) {
 			}
 			defer rc.Close()
 
-			if err := srv.HandlePacket(str, Request("127.0.0.1:8899"), rc.(*net.UDPConn)); err != nil {
+			if err := srv.HandlePacket(str, Request("127.0.0.1:8899"), rc.(*net.UDPConn), nil); err != nil {
 				t.Errorf("handle stream error: %v", err)
 			}
 		}()
@@ -977,7 +978,173 @@ func TestHandlePacket(t *testing.T) {
 			t.Errorf("receive payload error: want: foo, get: %v", string(b[:nr]))
 		}
 	})
-	t.Run("test handle packet bind", func(t *testing.T) {})
+}
+
+// bindMockStream wires a MockStream so HandlePacketBind can run end-to-end:
+// QUIC datagrams come from recv (one queued frame then EOF after release),
+// capsule writes/datagram sends are captured, and the stream read side blocks
+// until release so the capsule control loop stays alive for the round trip.
+func bindMockStream(t *testing.T, ctrl *gomock.Controller, recv []byte, release <-chan struct{}, sent chan<- []byte) *MockStream {
+	t.Helper()
+	str := NewMockStream(ctrl)
+
+	str.EXPECT().ReceiveDatagram(gomock.Any()).DoAndReturn(func(context.Context) ([]byte, error) {
+		return recv, nil
+	})
+	str.EXPECT().ReceiveDatagram(gomock.Any()).DoAndReturn(func(context.Context) ([]byte, error) {
+		<-release
+		return nil, io.EOF
+	}).AnyTimes()
+
+	str.EXPECT().Read(gomock.Any()).DoAndReturn(func([]byte) (int, error) {
+		<-release
+		return 0, io.EOF
+	}).AnyTimes()
+
+	str.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) {
+		return len(b), nil
+	}).AnyTimes()
+
+	str.EXPECT().SendDatagram(gomock.Any()).DoAndReturn(func(b []byte) error {
+		cp := make([]byte, len(b))
+		copy(cp, b)
+		sent <- cp
+		return nil
+	}).AnyTimes()
+
+	return str
+}
+
+// uncompressedDatagram builds the QUIC-DATAGRAM payload a bind client sends on
+// the default uncompressed context (id 2): <varint id=2><ip ver><addr><port><data>.
+func uncompressedDatagram(t *testing.T, peer netip.AddrPort, payload []byte) []byte {
+	t.Helper()
+	pl := UncompressedPayload{ContextID: 2, Payload: payload}
+	if peer.Addr().Is4() {
+		pl.IPVersion = 4
+	} else {
+		pl.IPVersion = 6
+	}
+	pl.Addr = peer.Addr()
+	pl.Port = peer.Port()
+	buf := &bytes.Buffer{}
+	if err := pl.Send(buf); err != nil {
+		t.Fatalf("build uncompressed datagram: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestHandlePacketBind(t *testing.T) {
+	srv, err := newUDPProxyServer("", zap.NewNop())
+	if err != nil {
+		t.Fatalf("create UDP proxy server error: %v", err)
+	}
+
+	// real UDP peer the bind client targets via the uncompressed context
+	pkt, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("create udp peer error: %v", err)
+	}
+	defer pkt.Close()
+	peer := netip.MustParseAddrPort(pkt.LocalAddr().String())
+
+	release := make(chan struct{})
+	sent := make(chan []byte, 4)
+	str := bindMockStream(t, gomock.NewController(t), uncompressedDatagram(t, peer, []byte("ping")), release, sent)
+
+	rc, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatalf("listen bind socket error: %v", err)
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		if err := srv.HandlePacketBind(str, Request("*"), rc, nil); err != nil {
+			t.Errorf("handle packet bind error: %v", err)
+		}
+	}()
+
+	// the proxy should forward "ping" out of its bound socket to the peer
+	b := make([]byte, 2048)
+	if err := pkt.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	nr, from, err := pkt.ReadFrom(b)
+	if err != nil {
+		t.Fatalf("peer did not receive forwarded packet: %v", err)
+	}
+	if !bytes.Equal(b[:nr], []byte("ping")) {
+		t.Fatalf("peer got %q, want ping", b[:nr])
+	}
+
+	// peer replies; the proxy must deliver it to the client as a QUIC datagram
+	// carrying a context id followed by the payload
+	if _, err := pkt.WriteTo([]byte("pong"), from); err != nil {
+		t.Fatalf("peer reply error: %v", err)
+	}
+
+	select {
+	case dg := <-sent:
+		_, n, err := quicvarint.Parse(dg)
+		if err != nil {
+			t.Fatalf("parse context id from datagram: %v", err)
+		}
+		if !bytes.Equal(dg[n:], []byte("pong")) {
+			t.Fatalf("client got payload %q, want pong", dg[n:])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for datagram to client")
+	}
+
+	close(release)
+	rc.Close()
+	<-finished
+}
+
+func TestHandlePacketBindACL(t *testing.T) {
+	srv, err := newUDPProxyServer("", zap.NewNop())
+	if err != nil {
+		t.Fatalf("create UDP proxy server error: %v", err)
+	}
+
+	pkt, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("create udp peer error: %v", err)
+	}
+	defer pkt.Close()
+	peer := netip.MustParseAddrPort(pkt.LocalAddr().String())
+
+	release := make(chan struct{})
+	sent := make(chan []byte, 4)
+	str := bindMockStream(t, gomock.NewController(t), uncompressedDatagram(t, peer, []byte("ping")), release, sent)
+
+	rc, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatalf("listen bind socket error: %v", err)
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		// deny every per-packet destination
+		if err := srv.HandlePacketBind(str, Request("*"), rc, func(netip.AddrPort) bool { return false }); err != nil {
+			t.Errorf("handle packet bind error: %v", err)
+		}
+	}()
+
+	// with the destination denied, the packet must be dropped, not forwarded
+	b := make([]byte, 2048)
+	if err := pkt.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := pkt.ReadFrom(b); err == nil {
+		t.Fatal("disallowed destination received a forwarded packet")
+	}
+
+	close(release)
+	rc.Close()
+	<-finished
 }
 
 func TestParseRequst(t *testing.T) {

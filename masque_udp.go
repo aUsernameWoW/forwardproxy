@@ -799,14 +799,15 @@ func (srv udpProxyServer) HandleStreamBind(c io.ReadWriter, req Request, rc *net
 // concrete Stream type (which changed from interface to struct in v0.54).
 type http3UDPStream interface {
 	io.Reader
+	io.Writer
 	SendDatagram([]byte) error
 	ReceiveDatagram(context.Context) ([]byte, error)
 }
 
-func (srv udpProxyServer) HandlePacket(str http3UDPStream, req Request, rc *net.UDPConn) error {
+func (srv udpProxyServer) HandlePacket(str http3UDPStream, req Request, rc *net.UDPConn, allowed func(netip.AddrPort) bool) error {
 	// https://github.com/quic-go/masque-go/issues/64
 	if req == "*" {
-		return srv.HandlePacketBind(str, req, rc)
+		return srv.HandlePacketBind(str, req, rc, allowed)
 	}
 
 	// https://github.com/quic-go/masque-go/blob/master/proxy.go
@@ -871,8 +872,209 @@ func (srv udpProxyServer) HandlePacket(str http3UDPStream, req Request, rc *net.
 	return nil
 }
 
-func (srv udpProxyServer) HandlePacketBind(str http3UDPStream, req Request, c *net.UDPConn) error {
-	return fmt.Errorf("connect-udp-bind over http3 is not supported yet")
+// HandlePacketBind serves connect-udp-bind over HTTP/3. Unlike the HTTP/1.1 and
+// HTTP/2 bind path (HandleStreamBind), which multiplexes UDP payloads and
+// compression capsules onto a single byte stream, HTTP/3 splits the two
+// transports per RFC 9298 §5: UDP payloads ride QUIC DATAGRAM frames while the
+// COMPRESSION_ASSIGN/COMPRESSION_CLOSE capsules ride the request stream. The
+// PacketConn (its context-id map and firewall flag) and the wire codecs are
+// shared with the HTTP/1.1+2 path; only the framing/transport differs here.
+func (srv udpProxyServer) HandlePacketBind(str http3UDPStream, req Request, rc *net.UDPConn, allowed func(netip.AddrPort) bool) error {
+	// pc.w is the request stream, so SendDatagram writes capsules (ASSIGN/CLOSE)
+	// there; UDP payloads are sent separately via str.SendDatagram (QUIC datagram).
+	pc := newPacketConn(str)
+
+	done := make(chan struct{})
+
+	// client -> proxy: each QUIC datagram is <context-id><...>. The client picks
+	// the destination per packet, so every one must clear the ACL/port allowlist.
+	go func() {
+		for {
+			dgram, err := str.ReceiveDatagram(context.Background())
+			if err != nil {
+				break
+			}
+
+			id, nr, err := quicvarint.Parse(dgram)
+			if err != nil {
+				continue
+			}
+
+			var (
+				addr    netip.AddrPort
+				payload []byte
+			)
+			if id == 2 {
+				// default uncompressed context: address is inline in the payload
+				if pc.Firewall() {
+					continue
+				}
+				up := UncompressedPayload{}
+				if err := up.Parse(dgram); err != nil {
+					continue
+				}
+				addr = netip.AddrPortFrom(up.Addr, up.Port)
+				payload = up.Payload
+			} else {
+				a, ok := pc.GetAddr(id)
+				if !ok {
+					// unknown context id: drop rather than guess a destination
+					continue
+				}
+				addr = a
+				payload = dgram[nr:]
+			}
+
+			if allowed != nil && !allowed(addr) {
+				continue
+			}
+
+			if _, err := rc.WriteToUDPAddrPort(payload, addr); err != nil {
+				break
+			}
+		}
+
+		rc.Close()
+		done <- struct{}{}
+	}()
+
+	// proxy -> client: UDP payloads from the bound socket become QUIC datagrams,
+	// allocating a compressed context (and emitting an ASSIGN capsule) per peer.
+	go func() {
+		bb := make([]byte, 2048)
+		for {
+			nr, addr, err := rc.ReadFromUDPAddrPort(bb)
+			if err != nil {
+				break
+			}
+
+			if addr.Addr().Is4In6() {
+				addr = netip.AddrPortFrom(netip.AddrFrom4(addr.Addr().As4()), addr.Port())
+			}
+
+			if err := pc.writeBindDatagram(str, bb[:nr], addr); err != nil {
+				break
+			}
+		}
+
+		done <- struct{}{}
+	}()
+
+	// compression control rides the request stream: register client-assigned
+	// (even) context ids, toggle the firewall on context 2, and acknowledge.
+	srv.handleBindCapsules(pc, str)
+
+	<-done
+	<-done
+	return nil
+}
+
+// writeBindDatagram delivers an inbound UDP payload to the client over HTTP/3.
+// It mirrors PacketConn.WritePacket but splits the transports: the
+// COMPRESSION_ASSIGN capsule goes on the request stream (via SendDatagram, whose
+// writer is the stream) while the payload goes in a QUIC DATAGRAM frame. Called
+// only from the single proxy->client goroutine, so the ContextID bump is safe.
+func (pc *PacketConn) writeBindDatagram(str http3UDPStream, b []byte, addr netip.AddrPort) error {
+	id, ok := pc.GetContextID(addr)
+	if !ok {
+		if pc.Firewall() {
+			return nil
+		}
+
+		pc.ContextID += 2 // odd context ids for server-assigned compression
+		id = pc.ContextID
+
+		pl := CompressionAssignPayload{ContextID: id}
+		if naddr := addr.Addr(); naddr.Is4() {
+			pl.IPVersion = 4
+			pl.Addr = naddr
+		} else {
+			pl.IPVersion = 6
+			pl.Addr = naddr
+		}
+		pl.Port = addr.Port()
+
+		if err := pc.SendDatagram(Datagram{
+			Type:    CompressionAssignValue,
+			Length:  pl.Len(),
+			Payload: &pl,
+		}); err != nil {
+			return err
+		}
+
+		pc.Add(id, netip.AddrPortFrom(pl.Addr, pl.Port))
+	}
+
+	buf := quicvarint.Append(make([]byte, 0, quicvarint.Len(id)+len(b)), id)
+	buf = append(buf, b...)
+	return str.SendDatagram(buf)
+}
+
+// handleBindCapsules consumes COMPRESSION_ASSIGN/COMPRESSION_CLOSE capsules from
+// the request stream and echoes each as its acknowledgement, mirroring the
+// capsule handling inside PacketConn.ReadPacket (which the HTTP/1.1+2 path uses
+// inline). It returns when the stream ends. Odd (server-assigned) context ids
+// are ignored; context id 2 toggles the uncompressed-context firewall.
+func (srv udpProxyServer) handleBindCapsules(pc *PacketConn, str http3UDPStream) {
+	buf := make([]byte, 2048)
+	for {
+		data := Datagram{}
+		if err := data.ReceiveBuffer(str, buf); err != nil {
+			return
+		}
+
+		bb := data.Payload.(*BytePayload).Payload
+		switch data.Type {
+		case CompressionAssignValue:
+			pl := CompressionAssignPayload{}
+			if err := pl.Parse(bb); err != nil {
+				return
+			}
+			if pl.ContextID&1 != 0 {
+				continue
+			}
+			switch pl.IPVersion {
+			case 0:
+				if pl.ContextID != 2 {
+					continue
+				}
+				pc.SetFirewall(false)
+			case 4, 6:
+				pc.Add(pl.ContextID, netip.AddrPortFrom(pl.Addr, pl.Port))
+			default:
+				continue
+			}
+			if err := pc.SendDatagram(Datagram{
+				Type:    CompressionAssignValue,
+				Length:  pl.Len(),
+				Payload: &pl,
+			}); err != nil {
+				return
+			}
+		case CompressionCloseValue:
+			pl := CompressionClosePayload{}
+			if err := pl.Parse(bb); err != nil {
+				return
+			}
+			if pl.ContextID&1 != 0 {
+				continue
+			}
+			if pl.ContextID == 2 {
+				pc.SetFirewall(true)
+			} else {
+				pc.Del(pl.ContextID)
+			}
+			if err := pc.SendDatagram(Datagram{
+				Type:    CompressionCloseValue,
+				Length:  pl.Len(),
+				Payload: &pl,
+			}); err != nil {
+				return
+			}
+		default:
+			continue
+		}
+	}
 }
 
 func (srv udpProxyServer) ParseRequest(r *http.Request) (Request, error) {
@@ -1123,9 +1325,13 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		return true, h.udpProxyServer.HandleStream(newHTTPStream(w, r.Body), req, rconn, h.destinationAllowed)
 	case 3:
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
+		if req == "*" {
+			w.Header().Set(ConnectUDPBindHeader, ConnectUDPBindHeaderValue)
+			w.Header().Set(ProxyPublicAddressHeader, rconn.LocalAddr().String())
+		}
 		w.WriteHeader(http.StatusOK)
 
-		return true, h.udpProxyServer.HandlePacket(w.(http3.HTTPStreamer).HTTPStream(), req, rconn)
+		return true, h.udpProxyServer.HandlePacket(w.(http3.HTTPStreamer).HTTPStream(), req, rconn, h.destinationAllowed)
 	default:
 		return false, nil
 	}
