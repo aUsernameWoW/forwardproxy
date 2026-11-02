@@ -2,6 +2,29 @@
 
 This package registers the `http.handlers.forward_proxy` module, which acts as an HTTPS proxy for accessing remote networks.
 
+## :rocket: Quick Build
+
+This fork tracks [klzgrad's `naive` branch](https://github.com/klzgrad/forwardproxy/tree/naive) and adds sing-box UoT (UDP over TCP) v1 & v2 support.
+
+Like upstream naive, it must be built against a **patched Caddy**: `caddy-sing-quic-bbrv1.patch` (sing-quic BBRv1 congestion control for QUIC/HTTP3) and `caddy-read-idle-timeout.patch` (lets authenticated tunnels outlive `read_body_idle`). A plain `xcaddy build --with ...` against stock Caddy fails to compile (`undefined: caddyhttp.IdleTimeoutsFromContext`).
+
+```shell
+git clone https://github.com/aUsernameWoW/forwardproxy && cd forwardproxy
+CADDY_VERSION=$(cat CADDY_VERSION)
+git -c core.autocrlf=false clone --depth 1 -b "$CADDY_VERSION" https://github.com/caddyserver/caddy .caddy-bbr
+git -C .caddy-bbr apply "$PWD/caddy-sing-quic-bbrv1.patch" "$PWD/caddy-read-idle-timeout.patch"
+go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+CGO_ENABLED=0 ~/go/bin/xcaddy build "$CADDY_VERSION" \
+  --replace "github.com/caddyserver/caddy/v2=$PWD/.caddy-bbr" \
+  --with "github.com/caddyserver/forwardproxy=$PWD"
+```
+
+Notes:
+
+- Build the Caddy version in `CADDY_VERSION`; the patches are not guaranteed to apply to any other release.
+- Add your other plugins with extra `--with module@version` flags.
+- `core.autocrlf=false` matters on Windows: CRLF checkouts make `git apply` reject the patches.
+
 ## :warning: Experimental!
 
 This module is EXPERIMENTAL. We need more users to test this module for bugs and weaknesses before we recommend its use from within surveilled networks or regions with active censorship. Do not rely on this code in situations where personal safety, freedom, or privacy are at risk.
@@ -23,6 +46,7 @@ We are also seeking experienced maintainers who have experience with these kinds
 - Access control lists
 - Optional probe resistance
 - PAC file
+- UDP over TCP (UoT) support for sing-box clients (compatible with sing-box UoT v1 & v2)
 
 
 ## Introduction
@@ -34,16 +58,12 @@ This Caddy module allows you to use your web server as a proxy server, configura
 
 First, you will have to know [how to use Caddy](https://caddyserver.com/docs/getting-started).
 
-Build Caddy with this plugin. You can add it from [Caddy's download page](https://caddyserver.com/download) or build it yourself with [xcaddy](https://github.com/caddyserver/xcaddy):
-
-```
-$ xcaddy build --with github.com/caddyserver/forwardproxy
-```
+Build Caddy with this plugin as described in [Quick Build](#rocket-quick-build). Caddy's download page and a plain `xcaddy build` produce the upstream plugin, without this fork's patches.
 
 Most people prefer the [Caddyfile](https://caddyserver.com/docs/caddyfile) for configuration. You can stand up a simple, wide-open unauthenticated forward proxy like this:
 
 ```
-example.com {
+:443, example.com {
 	# UNAUTHENTICATED! USE ONLY FOR TESTING
 	forward_proxy
 }
@@ -58,7 +78,7 @@ The `forward_proxy` has a default [directive order](https://caddyserver.com/docs
 	order forward_proxy first
 }
 
-example.com {
+:443, example.com {
 	# UNAUTHENTICATED! USE ONLY FOR TESTING
 	forward_proxy
 }
@@ -92,12 +112,17 @@ forward_proxy {
 	probe_resistance secret-link-kWWL9Q.com # alternatively you can use a real domain, such as caddyserver.com
 	serve_pac /secret-proxy.pac
 
-	dial_timeout            30
+	dial_timeout            30s
 
 	max_idle_conns          50
 	max_idle_conns_per_host 2
 
 	upstream https://user:password@extra-upstream-hop.com
+	# When upstream is socks5:// and the upstream itself understands
+	# sing UoT — currently this is essentially only sing-box (and other
+	# sing-based tools) — enable passthrough to skip local UoT decoding
+	# and forward the magic-address CONNECT to upstream as-is.
+	# passthrough_uot
 
 	acl {
 		allow     *.caddyserver.com
@@ -204,8 +229,8 @@ forward_proxy {
 
 ### Timeouts
 
-- `dial_timeout [integer]`  
-  Sets timeout (in seconds) for establishing TCP connection to target website. Affects all requests.
+- `dial_timeout [Duration]`  
+  Sets timeout (with units, e.g. 30s) for establishing TCP connection to target website. Affects all requests.
 
   Default: 30 seconds.
 
@@ -237,17 +262,32 @@ By default, forwardproxy will reuse connections by using Go's built-in connectio
   Supported schemes to localhost: socks5, http, https (certificate check is ignored).
 
   Default: no upstream proxy.
+- `passthrough_uot`
+  When set, the sing UoT magic addresses (`sp.v2.udp-over-tcp.arpa`,
+  `sp.udp-over-tcp.arpa`) are forwarded to the upstream as ordinary
+  CONNECT targets instead of being decoded into real UDP locally.
+  Only valid when `upstream` is a `socks5://` URL — Caddy will refuse
+  to start otherwise.
+
+  In practice the upstream must speak sing UoT for the passed-through
+  request to be parsed correctly; today that effectively means **only
+  sing-box (and other sing-based tools)**. Pointing this at a generic
+  SOCKS5 server that doesn't recognise the magic address will just
+  produce CONNECT failures (or a TCP stream of UoT bytes the upstream
+  has no idea what to do with).
+
+  When enabled, this avoids the local parse → SOCKS5 UDP ASSOCIATE
+  round-trip in fully UoT-aware chains.
+
+  Default: off; UoT is decoded locally (and, if a SOCKS5 upstream is
+  set, re-emitted via UDP ASSOCIATE).
 
 ## Get forwardproxy
-### Download prebuilt binary
-Binaries are at https://caddyserver.com/download  
-Don't forget to add `http.forwardproxy` plugin.
+### Prebuilt binary
+The `Build` workflow builds the patched Caddy on every push to `naive`, and attaches `caddy-forwardproxy-naive.tar.xz` to each published release. Binaries from https://caddyserver.com/download do **not** contain this fork.
 
 ### Build from source
-
-0. Install latest Golang 1.20 or above and set `export GO111MODULE=on`
-1. `go install github.com/caddyserver/forwardproxy/cmd/caddy@latest`  
-   Built `caddy` binary will be stored in $GOPATH/bin.  
+Follow [Quick Build](#rocket-quick-build). It needs Go 1.26 or newer.
 
 ## Client Configuration
 
