@@ -1,0 +1,49 @@
+name: Upstream check
+on:
+  schedule:
+    - cron: '17 2 * * 1' # Mondays 02:17 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  klzgrad_naive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Open an issue when klzgrad/naive has commits this branch lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --quiet https://github.com/klzgrad/forwardproxy naive
+          UP=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "Up to date with klzgrad/naive ($UP)"
+            exit 0
+          fi
+          TITLE="Upstream klzgrad/naive moved to ${UP:0:7}"
+          if [ -n "$(gh issue list --state open --search "\"$TITLE\" in:title" --json number -q '.[].number')" ]; then
+            echo "Issue already open: $TITLE"
+            exit 0
+          fi
+          BASE=$(git merge-base "$UP" HEAD)
+          {
+            echo "klzgrad/naive is at $UP, which \`${GITHUB_REF_NAME}\` does not contain."
+            echo
+            echo "Upstream commits since the last sync:"
+            echo '```'
+            git log --oneline "$BASE..$UP"
+            echo '```'
+            echo
+            echo "klzgrad rebases \`naive\`, so sync by rebasing this fork's patches onto it:"
+            echo '```'
+            echo "git fetch klzgrad && git rebase klzgrad/naive"
+            echo '```'
+            echo "Then rebuild against the patched Caddy in \`CADDY_VERSION\` and force-push."
+          } > body.md
+          gh issue create --title "$TITLE" --body-file body.md
