@@ -29,6 +29,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -42,6 +43,10 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/forwardproxy/httpclient"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
+	"github.com/sagernet/sing/protocol/socks"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 )
@@ -91,6 +96,14 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
+	// When true (and Upstream is a socks/socks5 URL), the sing UoT magic
+	// address (sp.v2.udp-over-tcp.arpa / sp.udp-over-tcp.arpa) is passed
+	// through to the SOCKS5 upstream as a regular CONNECT target instead
+	// of being decoded into real UDP locally. Useful when the upstream is
+	// itself UoT-aware (e.g. sing-box) and you want to avoid the local
+	// parse + UDP ASSOCIATE round-trip.
+	PassthroughUoT bool `json:"passthrough_uot,omitempty"`
+
 	// Access control list.
 	ACL []ACLRule `json:"acl,omitempty"`
 
@@ -102,6 +115,13 @@ type Handler struct {
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
+	// socksClient is set only when upstream is socks5://. UDP-over-TCP
+	// listens on this client (UDP ASSOCIATE) so audit/routing upstreams see
+	// UDP traffic instead of having it leak directly out of this process.
+	// In PassthroughUoT mode it also carries the magic-address CONNECT,
+	// because the stdlib x/net SOCKS5 dialer rejects the port-0 target sing
+	// uses for the UoT magic address.
+	socksClient *socks.Client
 
 	aclRules []aclRule
 
@@ -239,6 +259,26 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				return upstreamDialer.Dial(network, address)
 			}
 		}
+
+		// SOCKS5 upstreams can also carry UDP via UDP ASSOCIATE, and in
+		// PassthroughUoT mode they also carry the magic-address CONNECT
+		// (which the stdlib x/net SOCKS5 dialer would reject because of the
+		// port-0 target). Build a sing socks.Client so both paths have a
+		// non-validating dialer available.
+		switch strings.ToLower(h.upstream.Scheme) {
+		case "socks", "socks5":
+			client, err := socks.NewClientFromURL(N.SystemDialer, h.Upstream)
+			if err != nil {
+				return fmt.Errorf("build SOCKS5 client for upstream: %w", err)
+			}
+			h.socksClient = client
+		default:
+			if h.PassthroughUoT {
+				return fmt.Errorf("passthrough_uot requires a socks/socks5 upstream, got %q", h.upstream.Scheme)
+			}
+		}
+	} else if h.PassthroughUoT {
+		return errors.New("passthrough_uot requires an upstream to be configured")
 	}
 
 	return nil
@@ -521,6 +561,54 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
 
+	if host == uot.MagicAddress || host == uot.LegacyMagicAddress {
+		if h.PassthroughUoT && h.socksClient != nil {
+			// Forward the magic-address CONNECT untouched so the upstream's own
+			// UoT detection fires. sing's socks client is used here because the
+			// stdlib x/net SOCKS5 dialer (h.dialContext) rejects port 0.
+			conn, err := h.socksClient.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(hostPort))
+			if err != nil {
+				return nil, caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("upstream SOCKS5 UoT passthrough failed: %w", err))
+			}
+			return conn, nil
+		}
+		var pc net.PacketConn
+		switch {
+		case h.socksClient != nil:
+			// SOCKS5 upstream — route UDP through UDP ASSOCIATE so the upstream
+			// observes (and can filter / audit) the actual UDP traffic.
+			var err error
+			pc, err = h.socksClient.ListenPacket(ctx, M.Socksaddr{})
+			if err != nil {
+				return nil, caddyhttp.Error(http.StatusBadGateway,
+					fmt.Errorf("upstream SOCKS5 UDP ASSOCIATE failed: %w", err))
+			}
+		case h.upstream != nil:
+			// HTTP CONNECT upstreams cannot tunnel UDP. Refuse rather than
+			// silently leaking the UDP traffic directly out of this process.
+			return nil, caddyhttp.Error(http.StatusBadGateway,
+				errors.New("UDP-over-TCP cannot be tunneled through an HTTP CONNECT upstream"))
+		default:
+			udpConn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+			// The UoT codec decodes a client-chosen destination from every
+			// frame and writes to it via WriteTo. Without an upstream there is
+			// no other policy enforcement point, so wrap the socket to run the
+			// same port allowlist / ACL checks the TCP CONNECT path applies.
+			pc = &aclPacketConn{PacketConn: udpConn, allowed: h.destinationAllowed}
+		}
+		// The framing differs between v1 and v2; pick the one matching the magic
+		// the client used so legacy clients don't desync against a v2 server.
+		version := uot.Version
+		if host == uot.LegacyMagicAddress {
+			version = uot.LegacyVersion
+		}
+		return uot.NewServerConn(pc, version), nil
+	}
+
 	if h.upstream != nil {
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
@@ -572,6 +660,53 @@ match:
 	}
 
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+}
+
+// destinationAllowed reports whether a per-packet UDP destination chosen by
+// the client passes the port allowlist and ACL rules. UoT (via aclPacketConn)
+// lets the client select the destination of each datagram rather than a fixed
+// CONNECT target. The destination is always a resolved IP here (sing's UoT
+// codec resolves FQDNs before WriteTo), so an IP-based ACL walk applies.
+func (h Handler) destinationAllowed(addr netip.AddrPort) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	if !h.portIsAllowed(strconv.Itoa(int(addr.Port()))) {
+		return false
+	}
+	ip := addr.Addr()
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+	return h.hostIsAllowed(ip.String(), net.IP(ip.AsSlice()))
+}
+
+// aclPacketConn enforces destinationAllowed on each datagram destination for
+// the no-upstream UoT path. Disallowed destinations are dropped (reported as
+// written) so a single blocked packet doesn't tear down the whole UoT session.
+type aclPacketConn struct {
+	net.PacketConn
+	allowed func(netip.AddrPort) bool
+}
+
+func (c *aclPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if ap, ok := netAddrToAddrPort(addr); ok && !c.allowed(ap) {
+		return len(b), nil
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// netAddrToAddrPort extracts a netip.AddrPort from a net.Addr. The UoT codec
+// always passes a resolved *net.UDPAddr; the parse fallback covers other
+// implementations. Returns ok=false when no IP destination can be determined.
+func netAddrToAddrPort(addr net.Addr) (netip.AddrPort, bool) {
+	if u, ok := addr.(*net.UDPAddr); ok {
+		return u.AddrPort(), true
+	}
+	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return ap, true
+	}
+	return netip.AddrPort{}, false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {

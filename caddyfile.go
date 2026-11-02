@@ -184,6 +184,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.Upstream = args[0]
 
+		case "passthrough_uot":
+			args := d.RemainingArgs()
+			if len(args) != 0 {
+				return d.ArgErr()
+			}
+			h.PassthroughUoT = true
+
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				aclDirective := d.Val()
