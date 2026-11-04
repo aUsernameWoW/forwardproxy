@@ -611,7 +611,7 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		if host == uot.LegacyMagicAddress {
 			version = uot.LegacyVersion
 		}
-		return uot.NewServerConn(pc, version), nil
+		return newUoTServerConn(pc, version), nil
 	}
 
 	if h.upstream != nil {
